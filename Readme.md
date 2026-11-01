@@ -76,7 +76,7 @@ At every forward pass the GPU must read **all the model weights** (e.g. 1 GB for
 Step 1  one generation                     -> see the two phases exist
 Step 2  measure prefill and decode         -> see they behave very differently
 Step 3  many requests at once (batching)   -> exploit the idle GPU during decode
-Step 4  chunked prefill                    -> stop big prompts from freezing other users
+Step 4  chunked prefill                    -> stop big prompts from freezing other users (done)
 Step 5  disaggregated prefill/decode       -> give each phase its own GPU
 ```
 
@@ -270,10 +270,111 @@ For each batch size N, one `llm.generate()` call with N prompts, repeated 3 time
 - A busy server makes new requests wait in the queue, which increases their TTFT.
 - Per-request TTFT is not measured here: vLLM's offline API does not expose it reliably (it needs server mode).
 
+## Step 4: chunked prefill
+
+```bash
+python 04_chunked_prefill.py
+python 04_chunked_prefill.py --budgets 8192 2048 512 128 --big-prompt 6000 --users 16
+```
+
+### The problem (left open by step 3)
+
+Take a server where 16 users are chatting: every step produces 1 token for each of them, a step takes ~10 ms,
+so each user sees a new token every ~10 ms. Now a 6000-token prompt arrives (the "intruder").
+
+Without any protection, the scheduler puts the **whole prefill in one step**. From section 2.2, a pass over
+6000 tokens is compute-bound and takes far longer than a decode step (tens or hundreds of ms). During that
+single step **nobody else gets a token**:
+
+```
+without chunking:
+step 1   [chat x16]                      10 ms   -> 16 tokens
+step 2   [chat x16]                      10 ms   -> 16 tokens
+step 3   [chat x16 + PREFILL 6000]      ~150 ms  -> 16 tokens   <- every user waits 150 ms: ITL spike
+step 4   [chat x16]                      10 ms   -> 16 tokens
+```
+
+*(illustrative numbers, not measurements)*
+
+The users feel it as the text "freezing" for a moment. The average ITL looks fine, but the **tail** (p99, max) is bad.
+
+### The solution: cut the prefill in slices
+
+Each step has a **token budget** (`max_num_batched_tokens`): the maximum number of tokens processed in one forward pass.
+The decodes take 1 token each (16 of the budget), and the rest of the budget is given to the prefill:
+
+```
+with a budget of 512:
+step 3   [chat x16 + prefill slice 1 (496 tokens)]    ~20 ms
+step 4   [chat x16 + prefill slice 2 (496 tokens)]    ~20 ms
+...
+step 15  [chat x16 + prefill slice 13 (last tokens)]  ~15 ms   -> intruder gets its 1st token
+```
+
+Every step is now light. The chat users still get one token at every step, only a bit slower (20 ms instead of 10 ms),
+instead of one 150 ms freeze. This is what `enable_chunked_prefill=True` does, and the scheduler logic is simply:
+*"fill the step with the decodes first, then spend the remaining budget on prefill tokens"*.
+
+Bonus: mixing decode tokens (memory-bound) and prefill tokens (compute-bound) in the same pass uses the GPU
+better than separate passes, since the weights are read once for both (section 2.2 again).
+
+### The trade-off
+
+| Budget | Chat users' ITL | Intruder's TTFT | Steps for the prefill |
+|---|---|---|---|
+| big (>= prompt length) | rare but **huge spike** | **best** (everything in one step) | 1 |
+| medium (512) | small, regular slowdown | a bit longer | ~13 |
+| tiny (128) | smoothest | **much longer** | ~50 |
+
+A budget too small also wastes efficiency (many small passes, each re-reading the weights). In practice
+you pick a budget (vLLM's default is 2048 to 8192 depending on the version/hardware) that keeps the
+spike acceptable without delaying the prefill too much. It is the same central tension as section 2.5:
+**protecting the latency of the existing users costs latency to the new request**.
+
+### How the script measures it
+
+The offline `llm.generate()` returns only at the end, so we cannot see the individual tokens. Instead
+the script drives the engine by hand (`LLMEngine`: `add_request()` + `step()` in a loop) and takes a timestamp
+every time a request gets a new token.
+
+1. 16 chat users start (64-token prompt, 256 tokens to generate).
+2. After 30 steps (steady decode), one request with a 6000-token prompt is added.
+3. For each chat user we record the gap between two consecutive tokens (ITL), separately **before** the intruder
+   and **while its prefill is running**.
+4. The same scenario is replayed for each budget, each in a **separate process** (clean GPU state).
+
+The `max_num_batched_tokens` knob is what changes between runs: the biggest value (8192) lets the whole
+prompt fit in one step, so it behaves like "no chunking"; the small values force the slicing.
+
+| Column | Meaning |
+|---|---|
+| `budget` | `max_num_batched_tokens`: tokens allowed in one step |
+| `ITL before p50` | normal gap between two tokens, before the intruder (the reference) |
+| `ITL p50 / p99 / max` | gap between two tokens of chat users while the intruder is being prefilled |
+| `heaviest step` | duration of the longest engine step during that period |
+| `intruder steps` | number of steps needed to finish the intruder's prefill |
+| `intruder TTFT` | time between the arrival of the intruder and its first token |
+
+### What to observe
+
+1. With a big budget, **`ITL max` and `heaviest step` are large** (about the duration of the whole prefill), while `ITL p50` stays normal.
+   The average hides the problem: look at the tail.
+2. When the budget decreases, `ITL max` drops toward the reference value.
+3. At the same time, `intruder steps` and `intruder TTFT` go up. This is the price.
+4. `ITL p50` slightly increases for small budgets: each step now carries prefill tokens too.
+
+> Note: written for the vLLM `LLMEngine` API (`from_engine_args`, `add_request`, `step`). If your version changed
+> these signatures, adapt the few lines in `run_scenario()`. In recent vLLM (V1 engine) chunked prefill is
+> always on, and `max_num_batched_tokens` is the real control, which is why the script varies it.
+
+### Limits (and why step 5 exists)
+
+Even with chunking, the prefill and the decodes **still share the same GPU**: the decodes are slowed down
+(a little, regularly) by the prefill tokens in their steps. Chunking reduces the spike but does not remove the
+interference. To remove it completely, the two phases must run on different GPUs.
+
 ## Next steps
 
-- **Step 4**: chunked prefill (`enable_chunked_prefill=True`) so large prompts don't block other requests' decode.
-  Idea: cut the big prefill into slices and mix each slice with the ongoing decodes, so no single step is too heavy.
 - **Step 5**: disaggregated prefill/decode (two vLLM instances, KV cache transfer via the KV connector).
   Idea: since the phases need different things (compute vs memory bandwidth), run them on separate GPUs
   and send the KV cache from the prefill GPU to the decode GPU.
