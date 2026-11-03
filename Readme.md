@@ -5,7 +5,7 @@ Each step is a small script you can run and measure.
 
 ---
 
-# Part 1: the big picture (simple version)
+# Part 1: the big picture
 
 ## 1.1 What does an LLM actually do?
 
@@ -77,7 +77,7 @@ Step 1  one generation                     -> see the two phases exist
 Step 2  measure prefill and decode         -> see they behave very differently
 Step 3  many requests at once (batching)   -> exploit the idle GPU during decode
 Step 4  chunked prefill                    -> stop big prompts from freezing other users (done)
-Step 5  disaggregated prefill/decode       -> give each phase its own GPU
+Step 5  disaggregated prefill/decode       -> give each phase its own GPU (done)
 ```
 
 ---
@@ -226,7 +226,6 @@ of tokens produced is multiplied by the batch size.
 | 16 | ~11 ms | 16 | ~1450 tok/s |
 | 64 | ~14 ms | 64 | ~4500 tok/s |
 
-*(illustrative numbers, not measurements)*
 
 Throughput grows almost linearly with N until the GPU stops being memory-bound (around the break-even point
 of section 2.2), then flattens. The step time also slowly increases because the attention part reads one
@@ -294,7 +293,6 @@ step 3   [chat x16 + PREFILL 6000]      ~150 ms  -> 16 tokens   <- every user wa
 step 4   [chat x16]                      10 ms   -> 16 tokens
 ```
 
-*(illustrative numbers, not measurements)*
 
 The users feel it as the text "freezing" for a moment. The average ITL looks fine, but the **tail** (p99, max) is bad.
 
@@ -373,8 +371,81 @@ Even with chunking, the prefill and the decodes **still share the same GPU**: th
 (a little, regularly) by the prefill tokens in their steps. Chunking reduces the spike but does not remove the
 interference. To remove it completely, the two phases must run on different GPUs.
 
+## Step 5: disaggregated prefill/decode
+
+```bash
+python 05_disaggregated.py          # needs 2 GPUs
+python 05_disaggregated.py --big-prompt 6000 --users 16
+```
+
+### The problem (left open by step 4)
+
+Chunking only *reduces* the interference: prefill tokens and decode tokens still share each pass on the same GPU.
+And the two phases want opposite things (section 1.4): prefill is compute-bound, decode is memory-bandwidth-bound,
+and they care about different metrics (TTFT vs ITL). One GPU setup cannot be ideal for both.
+
+### The solution: one GPU per phase
+
+```
+                 +-------------------+   KV cache    +-------------------+
+ request ------> |  PREFILL server   | ------------> |   DECODE server   | ----> tokens
+ (prompt)        |  GPU 0            |  (NIXL, GPU   |   GPU 1           |
+                 |  compute-bound    |   to GPU)     |   memory-bound    |
+                 +-------------------+               +-------------------+
+```
+
+1. The prefill server processes the whole prompt (which fills the KV cache), returns 1 token and a description
+   of where the KV blocks are (`kv_transfer_params`).
+2. The decode server receives that description, **pulls the KV cache** through the KV connector (`NixlConnector`),
+   skips the prefill, and generates the rest of the answer.
+
+The decode GPU never runs a big prefill, so the chat users' ITL is no longer disturbed, whatever the size of the
+intruder. Each pool can also be sized independently (more prefill GPUs for long prompts, more decode GPUs for
+many users).
+
+### The trade-off
+
+| | Colocated (+ chunking) | Disaggregated |
+|---|---|---|
+| Interference prefill -> decode | reduced, not removed | **none** |
+| Intruder TTFT | prefill + queue | prefill + **KV transfer** + extra hop |
+| GPUs | 1 | 2 or more, each can sit idle if the load is unbalanced |
+| Complexity | low | proxy, connector, network between GPUs |
+
+The KV cache is big (section 2.3), so the transfer needs a fast link (NVLink, InfiniBand/RDMA). With a slow link
+the transfer eats the gain. Disaggregation pays off with long prompts, strict ITL targets and enough load to keep
+both pools busy.
+
+### How the script measures it
+
+`05_disaggregated.py` starts the vLLM servers itself and replays the step 4 scenario on each setup:
+
+1. **colocated**: one `vllm serve` on GPU 0.
+2. **disaggregated**: a prefill server on GPU 0 and a decode server on GPU 1, both with
+   `--kv-transfer-config '{"kv_connector":"NixlConnector","kv_role":"kv_both"}'`. The script acts as the proxy
+   (prefill with `max_tokens=1` and `do_remote_decode`, then decode with the returned `kv_transfer_params`).
+3. 16 chat users stream their answer; after `--warm-seconds` the intruder (6000-token prompt) is sent.
+4. Every streamed chunk is timestamped, to compute the chat users' ITL while the intruder is processed.
+
+| Column | Meaning |
+|---|---|
+| `ITL before p50` | normal gap between two tokens, before the intruder |
+| `ITL p50 / p99 / max` | gap between two tokens of chat users while the intruder is processed |
+| `intruder TTFT` | time between the intruder's arrival and its first token |
+| `intruder total` | time until the intruder is completely finished |
+
+### What to observe
+
+1. Colocated: `ITL p99` / `max` jump while the intruder is prefilled. Disaggregated: they stay close to `ITL before`.
+2. The intruder's TTFT is **not better**, often slightly worse (KV transfer + extra hop).
+3. Disaggregation does not make anything faster by itself: it **isolates** the phases, so each metric can be
+   protected independently.
+
+> Note: written for the `NixlConnector` flow (`kv_transfer_params` in the OpenAI-compatible server, recent vLLM).
+> The connector API evolves: if your version differs, adapt `run_request()` and `start_server()`. The script was
+> **not run on real hardware** when written; if a server fails to start, run the `vllm serve` command by hand
+> to see its logs (the script hides them).
+
 ## Next steps
 
-- **Step 5**: disaggregated prefill/decode (two vLLM instances, KV cache transfer via the KV connector).
-  Idea: since the phases need different things (compute vs memory bandwidth), run them on separate GPUs
-  and send the KV cache from the prefill GPU to the decode GPU.
+- Beyond this project: prefix caching, speculative decoding, quantization, tensor/pipeline parallelism.
